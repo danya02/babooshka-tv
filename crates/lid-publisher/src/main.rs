@@ -21,6 +21,12 @@ struct Args {
     /// If not provided, defaults to /tmp/run/lid-status.sock
     #[clap(short, long)]
     status_socket: Option<PathBuf>,
+
+    /// Simulated mode: instead of using the lid file,
+    /// waits for EOL on the stdin,
+    /// then toggles the state.
+    #[clap(long)]
+    simulate: bool,
 }
 
 fn main() {
@@ -68,7 +74,11 @@ fn main() {
     {
         let shared = shared.clone();
         let lid_file = lid_file.clone();
-        std::thread::spawn(move || check_lid_loop(&lid_file, shared));
+        if args.simulate {
+            std::thread::spawn(move || check_lid_loop_simulated(shared));
+        } else {
+            std::thread::spawn(move || check_lid_loop(&lid_file, shared));
+        }
     }
 
     let socket = UnixListener::bind(status_socket).expect("failed to listen to socket");
@@ -102,6 +112,24 @@ fn check_lid_loop(lid_file: &std::path::Path, shared: Arc<(Mutex<LidState>, Cond
             guard.changed_at = api_types::now();
             shared.1.notify_all();
         }
+    }
+}
+
+fn check_lid_loop_simulated(shared: Arc<(Mutex<LidState>, Condvar)>) -> ! {
+    println!("SIMULATION MODE");
+    let mut is_open = {
+        let lock = shared.0.lock().expect("failed to lock state");
+        lock.lid_open
+    };
+    loop {
+        println!("current state: is_open={is_open}");
+        println!("press enter to toggle...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+        is_open = !is_open;
+        let mut guard = shared.0.lock().expect("failed to lock state");
+        guard.lid_open = is_open;
+        guard.changed_at = api_types::now();
+        shared.1.notify_all();
     }
 }
 
