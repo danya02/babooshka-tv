@@ -14,7 +14,9 @@ impl WatchLaterState {
     }
 }
 
-pub async fn load_from_file(play_state: &PathBuf) -> Result<WatchLaterState, std::io::Error> {
+pub async fn load_from_file(
+    play_state: &PathBuf,
+) -> Result<Option<WatchLaterState>, std::io::Error> {
     let watch_later_text = match tokio::fs::read_to_string(&play_state).await {
         Ok(s) => s,
         Err(why) => match why.kind() {
@@ -26,20 +28,15 @@ pub async fn load_from_file(play_state: &PathBuf) -> Result<WatchLaterState, std
     let watch_later_text = watch_later_text.trim();
 
     let watch_later = if watch_later_text.is_empty() {
-        WatchLaterState::new(
-            "/home/danya/Videos/yt-downloads/In Search Of A Flat Earth [JTfhYyTuT44].webm".into(),
-        )
+        None
     } else {
         match serde_json::from_str(watch_later_text) {
-            Ok(s) => s,
+            Ok(s) => Some(s),
             Err(why) => {
                 eprintln!(
                     "failed to deserialize watch later state: {why}. Resetting to known good state"
                 );
-                WatchLaterState::new(
-                    "/home/danya/Videos/yt-downloads/In Search Of A Flat Earth [JTfhYyTuT44].webm"
-                        .into(),
-                )
+                None
             }
         }
     };

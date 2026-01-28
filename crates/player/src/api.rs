@@ -63,6 +63,7 @@ impl MpvPlayer {
         let process = process
             .arg("--input-ipc-server=/tmp/run/mpv-ipc.sock")
             .arg("--keep-open=yes")
+            .arg("--fullscreen")
             .arg(init_file)
             .stdin(Stdio::null())
             .process_group(0)

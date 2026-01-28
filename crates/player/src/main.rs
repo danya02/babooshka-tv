@@ -3,7 +3,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, task::JoinSet};
 use tracing::info;
 
 mod api;
@@ -42,14 +42,17 @@ async fn main() {
         .expect("failed to init player");
 
     let mut watch_later = watch_later::load_from_file(&args.play_state).await.unwrap();
-
-    player.restore_state(&watch_later).await.unwrap();
+    if let Some(data) = &watch_later {
+        player.restore_state(&data).await.unwrap();
+    }
 
     let player = Arc::new(Mutex::new(player));
 
+    let mut tasks = JoinSet::new();
+
     {
         let player = player.clone();
-        tokio::spawn(async move {
+        tasks.spawn(tokio::spawn(async move {
             let mut lid_status = lid_subscriber::AsyncLidSubscriber::new()
                 .await
                 .expect("failed to subscribe to lid status");
@@ -67,29 +70,29 @@ async fn main() {
                     }
                 }
             }
-        });
+        }));
     }
 
     {
         let player = player.clone();
         let play_state = args.play_state.clone();
-        tokio::spawn(async move {
+        tasks.spawn(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 let old_state = watch_later;
-                watch_later = player.lock().await.save_state().await.unwrap();
+                watch_later = Some(player.lock().await.save_state().await.unwrap());
                 if old_state != watch_later {
                     tokio::fs::write(&play_state, serde_json::to_string(&watch_later).unwrap())
                         .await
                         .unwrap();
                 }
             }
-        });
+        }));
     }
 
     {
         let player = player.clone();
-        tokio::spawn(async move {
+        tasks.spawn(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
                 let duration = player.lock().await.get_file_duration().await.unwrap();
@@ -110,12 +113,12 @@ async fn main() {
                         .unwrap();
                 }
             }
-        });
+        }));
     }
 
     {
         let player = player.clone();
-        tokio::spawn(async move {
+        tasks.spawn(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(2125)).await;
                 if !player.lock().await.is_running() {
@@ -123,12 +126,18 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
-        });
+        }));
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen to ctrl-c");
+    tokio::select! {
+        _ = tasks.join_next() => {
+            tracing::error!("task exited");
+            return;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received ctrl-c");
+        }
+    }
 
     let _ = player.lock().await.send_quit();
 }
