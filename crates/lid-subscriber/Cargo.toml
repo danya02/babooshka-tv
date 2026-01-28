@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 api-types = { version = "0.1.0", path = "../api-types" }
 serde_json = "1.0.149"
+tokio = { version = "1", features = ["net", "io-util"], optional = true }
+
+[features]
+tokio = ["dep:tokio"]
