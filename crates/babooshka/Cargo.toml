@@ -1,0 +1,19 @@
+[package]
+name = "babooshka"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4.5.54", features = ["derive"] }
+toml = "0.8"
+player = { path = "../player" }
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls-no-provider", "rustls-native-certs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
+rppal = "0.22"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

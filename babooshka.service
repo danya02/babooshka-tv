@@ -1,0 +1,21 @@
+[Unit]
+Description=babooshka TV player
+After=graphical-session.target pipewire.service pipewire-pulse.service srv.mount
+Wants=pipewire.service pipewire-pulse.service
+
+[Service]
+ExecStart=/opt/babooshka --config /srv/babooshka-config.toml
+Restart=always
+RestartSec=5
+
+# Inherit display/audio session variables from the user environment.
+# These are populated at login by PAM / the compositor via
+# dbus-update-activation-environment or systemctl --user import-environment.
+PassEnvironment=WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR PULSE_RUNTIME_PATH
+# Fallback values in case PassEnvironment hasn't been populated yet at start.
+Environment=WAYLAND_DISPLAY=wayland-1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=RUST_LOG=babooshka=debug
+
+[Install]
+WantedBy=default.target

@@ -17,21 +17,23 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::watch_later::WatchLaterState;
 
+// Type aliases to keep the field declarations readable.
+type PendingCommands = Arc<Mutex<HashMap<usize, tokio::sync::oneshot::Sender<CommandResponse>>>>;
+type PendingEvents = Arc<
+    Mutex<
+        Vec<(
+            Box<dyn Fn(&EventData) -> bool + 'static + Send>,
+            tokio::sync::oneshot::Sender<EventData>,
+        )>,
+    >,
+>;
+
 pub struct MpvPlayer {
     process: tokio::process::Child,
     socket: OwnedWriteHalf,
-    recv_loop: tokio::task::JoinHandle<()>,
     last_cmd_id: usize,
-    waiting_command_statuses:
-        Arc<Mutex<HashMap<usize, tokio::sync::oneshot::Sender<CommandResponse>>>>,
-    waiting_events: Arc<
-        Mutex<
-            Vec<(
-                Box<dyn Fn(&EventData) -> bool + 'static + Send>,
-                tokio::sync::oneshot::Sender<EventData>,
-            )>,
-        >,
-    >,
+    pending_commands: PendingCommands,
+    pending_events: PendingEvents,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -59,99 +61,96 @@ pub struct EventData {
 
 impl MpvPlayer {
     pub async fn new(init_file: &str) -> Result<Self, std::io::Error> {
-        let mut process = tokio::process::Command::new("mpv");
-        let process = process
-            .arg("--input-ipc-server=/tmp/run/mpv-ipc.sock")
+        // Ensure the directory for the IPC socket exists.
+        const IPC_SOCK: &str = "/tmp/run/mpv-ipc.sock";
+        tokio::fs::create_dir_all("/tmp/run").await.ok();
+
+        // Explicitly forward display/runtime vars so mpv always gets a video
+        // output even when systemd's PassEnvironment hasn't propagated them yet.
+        let mut cmd = tokio::process::Command::new("mpv");
+        for var in &["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR"] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        let mut process = cmd
+            .arg(format!("--input-ipc-server={IPC_SOCK}"))
             .arg("--keep-open=yes")
-            .arg("--fullscreen")
+            // Use PipeWire directly; fall back to PulseAudio compat, then ALSA.
+            // This prevents mpv from grabbing the ALSA device exclusively.
+            .arg("--ao=pipewire,pulse,alsa")
+            .arg("--vo=wlshm")
             .arg(init_file)
             .stdin(Stdio::null())
             .process_group(0)
-            .kill_on_drop(true);
-        // let process = unsafe {
-        //     process.pre_exec(|| {
-        //         libc::signal(libc::SIGINT, libc::SIG_IGN);
-        //         Ok(())
-        //     })
-        // };
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn mpv");
 
-        let mut process = process.spawn().expect("failed to spawn mpv");
-
+        // Wait up to 2 seconds for the IPC socket to appear.
         let mut socket = None;
         for _ in 0..20 {
-            match UnixStream::connect("/tmp/run/mpv-ipc.sock").await {
+            match UnixStream::connect(IPC_SOCK).await {
                 Ok(conn) => {
                     socket = Some(conn);
                     break;
                 }
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             }
         }
 
         let Some(socket) = socket else {
-            // could not connect, probably the process failed to start
             process.kill().await.expect("failed to kill mpv");
             return Err(std::io::Error::new(
                 ErrorKind::NotConnected,
-                "could not connect to mpv",
+                format!("could not connect to mpv IPC socket at {IPC_SOCK}"),
             ));
         };
 
-        let waiting_command_statuses = Arc::new(Mutex::new(HashMap::new()));
-        let waiting_events = Arc::new(Mutex::new(Vec::new()));
+        let pending_commands: PendingCommands = Arc::new(Mutex::new(HashMap::new()));
+        let pending_events: PendingEvents = Arc::new(Mutex::new(Vec::new()));
 
-        let (rx, tx) = socket.into_split();
+        let (read_half, write_half) = socket.into_split();
 
-        let recv_loop = {
-            let waiting_command_statuses = waiting_command_statuses.clone();
-            let waiting_events = waiting_events.clone();
-            tokio::spawn(MpvPlayer::recv_loop(
-                rx,
-                waiting_command_statuses,
-                waiting_events,
-            ))
-        };
+        // Detach the recv loop — it holds Arc clones and will stop naturally
+        // when the socket closes (i.e. when mpv exits).
+        tokio::spawn(Self::recv_loop(
+            read_half,
+            pending_commands.clone(),
+            pending_events.clone(),
+        ));
 
-        let mut out = Self {
+        let mut player = Self {
             process,
-            socket: tx,
-            recv_loop,
-            waiting_command_statuses,
-            waiting_events,
+            socket: write_half,
             last_cmd_id: 0,
+            pending_commands,
+            pending_events,
         };
 
-        out.send_cmd(vec!["observe_property".json(), 1.json(), "time-pos".json()])
+        player
+            .send_cmd(vec!["observe_property".json(), 1.json(), "time-pos".json()])
             .await?;
 
-        Ok(out)
+        Ok(player)
     }
 
     pub fn is_running(&mut self) -> bool {
-        self.process.try_wait().expect("failed to wait process");
-        self.process.id().is_some()
+        match self.process.try_wait() {
+            Ok(Some(_)) => false, // process has exited
+            Ok(None) => true,     // process is still running
+            Err(e) => {
+                warn!("Failed to check mpv process status: {e}");
+                false
+            }
+        }
     }
 
     async fn recv_loop(
         socket: OwnedReadHalf,
-        waiting_command_statuses: Arc<
-            Mutex<HashMap<usize, tokio::sync::oneshot::Sender<CommandResponse>>>,
-        >,
-        waiting_events: Arc<
-            Mutex<
-                Vec<(
-                    Box<dyn Fn(&EventData) -> bool + 'static + Send>,
-                    tokio::sync::oneshot::Sender<EventData>,
-                )>,
-            >,
-        >,
+        pending_commands: PendingCommands,
+        pending_events: PendingEvents,
     ) {
-        let mut reader = tokio::io::BufReader::new(socket);
-        let mut buf = String::new();
-
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
         enum RecvMsg {
@@ -159,63 +158,67 @@ impl MpvPlayer {
             Event(EventData),
         }
 
+        let mut reader = tokio::io::BufReader::new(socket);
+        let mut buf = String::new();
+
         loop {
-            let count = reader
-                .read_line(&mut buf)
-                .await
-                .expect("failed to read line");
-            if count == 0 {
-                return;
+            buf.clear();
+            match reader.read_line(&mut buf).await {
+                Ok(0) => return, // socket closed
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("mpv IPC read error: {e}");
+                    return;
+                }
             }
 
             match serde_json::from_str(&buf) {
                 Ok(RecvMsg::Command(cmd)) => {
                     if cmd.error == "success" {
-                        debug!("mpv sent command response: {cmd:?}");
+                        debug!("mpv command response: {cmd:?}");
                     } else {
-                        warn!("mpv sent command response: {cmd:?}");
+                        warn!("mpv command error response: {cmd:?}");
                     }
-                    if let Some(tx) = waiting_command_statuses.lock().remove(&cmd.request_id) {
-                        let id = cmd.request_id;
-                        if let Err(_) = tx.send(cmd) {
-                            warn!("Listener for command id {id} dropped before receiving response");
-                        };
-                    } else {
-                        println!(
-                            "got unexpected command response (we aren't waiting for this ID): {cmd:#?}"
-                        );
+                    match pending_commands.lock().remove(&cmd.request_id) {
+                        Some(tx) => {
+                            let id = cmd.request_id;
+                            if tx.send(cmd).is_err() {
+                                warn!("Caller for command {id} dropped before receiving response");
+                            }
+                        }
+                        None => {
+                            debug!(
+                                "Unexpected command response (not waiting for this ID): {cmd:?}"
+                            );
+                        }
                     }
                 }
                 Ok(RecvMsg::Event(evt)) => {
-                    let mut waiting = waiting_events.lock();
-
-                    // property-change events for time-pos are spammy, skip them for display
-                    if !(evt.event == "property-change"
-                        && evt.name.as_ref().is_some_and(|v| v == "time-pos"))
-                    {
-                        debug!(
-                            "mpv sent event: {evt:?}, checking it against {} current predicates",
-                            waiting.len()
-                        );
+                    // time-pos property-change events are very frequent; don't log them.
+                    let is_timepos =
+                        evt.event == "property-change" && evt.name.as_deref() == Some("time-pos");
+                    if !is_timepos {
+                        debug!("mpv event: {evt:?}");
                     }
-                    let mut removed = 0;
-                    for idx in 0..waiting.len() {
-                        let predicate = &waiting[idx - removed].0;
-                        if predicate(&evt) {
-                            debug!("event matches predicate at index {idx}");
-                            let (_, tx) = waiting.remove(idx);
-                            removed += 1;
-                            tx.send(evt.clone()).expect("failed to send event");
+
+                    let mut waiting = pending_events.lock();
+                    let mut i = 0;
+                    while i < waiting.len() {
+                        if (waiting[i].0)(&evt) {
+                            let (_, tx) = waiting.remove(i);
+                            if tx.send(evt.clone()).is_err() {
+                                warn!("Event subscriber dropped before receiving event");
+                            }
+                            // don't increment i — the next element shifted into position i
                         } else {
-                            debug!("event does not match predicate at index {idx}");
+                            i += 1;
                         }
                     }
                 }
                 Err(e) => {
-                    println!("failed to deserialize message {buf:?}: {e}");
+                    warn!("Failed to deserialize mpv message {buf:?}: {e}");
                 }
             }
-            buf.clear();
         }
     }
 
@@ -224,11 +227,10 @@ impl MpvPlayer {
         &mut self,
         msg: T,
     ) -> Result<(), std::io::Error> {
-        let msg = serde_json::to_string(&msg).expect("failed to serialize message");
-        self.socket.write_all(msg.as_bytes()).await?;
-        self.socket.write(b"\n").await?;
+        let serialized = serde_json::to_string(&msg).expect("failed to serialize mpv message");
+        self.socket.write_all(serialized.as_bytes()).await?;
+        self.socket.write_all(b"\n").await?;
         self.socket.flush().await?;
-        debug!("sent command");
         Ok(())
     }
 
@@ -247,27 +249,19 @@ impl MpvPlayer {
         &mut self,
         command: Vec<impl Into<serde_json::Value> + std::fmt::Debug>,
     ) -> Result<CommandResponse, std::io::Error> {
-        let id = self.last_cmd_id + 1;
         self.last_cmd_id += 1;
+        let id = self.last_cmd_id;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiting_command_statuses.lock().insert(id, tx);
+        self.pending_commands.lock().insert(id, tx);
         self.send(CommandMsg {
-            command: command.into_iter().map(|s| s.into()).collect(),
+            command: command.into_iter().map(Into::into).collect(),
             request_id: id,
             asynk: true,
         })
         .await?;
-        Ok(rx.await.expect("recv_loop closed"))
-    }
-
-    #[instrument(skip(self))]
-    pub async fn osd_text(&mut self, text: &str) -> Result<(), std::io::Error> {
-        self.send(CommandMsg {
-            command: vec!["show-text".into(), text.into()],
-            request_id: 0,
-            asynk: false,
-        })
-        .await
+        Ok(rx
+            .await
+            .expect("recv_loop closed before responding to command"))
     }
 
     #[instrument(skip(self))]
@@ -311,75 +305,24 @@ impl MpvPlayer {
 
     #[instrument(skip(self))]
     pub async fn loadfile(&mut self, path: &str) -> Result<(), std::io::Error> {
-        debug!("loading media");
         self.send_cmd(vec!["loadfile".json(), path.json()]).await?;
         Ok(())
     }
 
-    #[instrument(skip(self, event_match))]
-    pub async fn wait_for_event(
-        &self,
-        event_match: impl Fn(&EventData) -> bool + 'static + Send,
-    ) -> Result<EventData, std::io::Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiting_events.lock().push((Box::new(event_match), tx));
-        debug!("event subscription created");
-        let event = rx.await.map_err(|_| {
-            std::io::Error::new(
-                ErrorKind::Other,
-                "event receiver dropped -- probably event loop crashed or player exited",
-            )
-        })?;
-        debug!("event received: {event:?}");
-        Ok(event)
-    }
-
+    /// Set the volume gain offset in dB (mpv `volume-gain` property).
+    /// Positive values amplify, negative attenuate.  0.0 = no adjustment.
     #[instrument(skip(self))]
-    pub async fn wait_for_event_by_name(&self, name: &str) -> Result<EventData, std::io::Error> {
-        let name = name.to_string();
-        debug!("waiting for event by name");
-        let ev = self
-            .wait_for_event(move |e| (e.name.as_ref()).is_some_and(|n| name == *n))
-            .await;
-        debug!("event received: {:?}", ev);
-        ev
-    }
-
-    #[instrument(skip(self))]
-    pub async fn save_state(&mut self) -> Result<WatchLaterState, std::io::Error> {
-        let path = self.get_path().await?;
-        let time = self.get_playback_time().await?;
-        debug!("Saving state: path: {path}, time: {time}");
-        Ok(WatchLaterState {
-            path: path.into(),
-            time,
-        })
-    }
-
-    #[instrument(skip(self))]
-    pub async fn restore_state(&mut self, state: &WatchLaterState) -> Result<(), std::io::Error> {
-        info!("stopping current playback");
-        self.send_cmd(vec!["stop".json()]).await?;
-
-        info!("commanding load file {}", state.path.display());
-        self.loadfile(state.path.to_string_lossy().as_ref()).await?;
-        info!("waiting for file to load");
-        self.wait_for_event(|e| {
-            warn!("event: {e:?}");
-            e.event == "file-loaded"
-                || (e.event == "property-change")
-                    && e.name.as_ref().is_some_and(|n| n == "time-pos")
-        })
+    pub async fn set_volume_gain(&mut self, gain_db: f64) -> Result<(), std::io::Error> {
+        self.send_cmd(vec![
+            "set_property".json(),
+            "volume-gain".json(),
+            gain_db.json(),
+        ])
         .await?;
-
-        // TODO: how to ensure that the player is ready?
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        info!("Setting playback position to {}", state.time);
-        self.set_playback_time(state.time).await?;
         Ok(())
     }
 
+    #[instrument(skip(self))]
     pub async fn get_file_duration(&mut self) -> Result<f64, std::io::Error> {
         let response = self
             .send_cmd(vec!["get_property".json(), "duration/full".json()])
@@ -390,15 +333,60 @@ impl MpvPlayer {
             .as_f64()
             .unwrap_or_default())
     }
+
+    #[instrument(skip(self, predicate))]
+    pub async fn wait_for_event(
+        &self,
+        predicate: impl Fn(&EventData) -> bool + 'static + Send,
+    ) -> Result<EventData, std::io::Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_events.lock().push((Box::new(predicate), tx));
+        rx.await.map_err(|_| {
+            std::io::Error::new(
+                ErrorKind::Other,
+                "mpv event loop closed before the expected event arrived",
+            )
+        })
+    }
+
+    #[instrument(skip(self))]
+    pub async fn save_state(&mut self) -> Result<WatchLaterState, std::io::Error> {
+        let path = self.get_path().await?;
+        let time = self.get_playback_time().await?;
+        debug!("Saving state: path={path}, time={time}");
+        Ok(WatchLaterState {
+            path: path.into(),
+            time,
+        })
+    }
+
+    #[instrument(skip(self))]
+    pub async fn restore_state(&mut self, state: &WatchLaterState) -> Result<(), std::io::Error> {
+        info!("Restoring state: {}", state.path.display());
+        self.send_cmd(vec!["stop".json()]).await?;
+        self.loadfile(state.path.to_string_lossy().as_ref()).await?;
+
+        info!("Waiting for file to load");
+        self.wait_for_event(|e| {
+            debug!("restore_state waiting, got event: {e:?}");
+            e.event == "file-loaded"
+                || (e.event == "property-change" && e.name.as_deref() == Some("time-pos"))
+        })
+        .await?;
+
+        // Give mpv a moment to settle before seeking.
+        // TODO: replace with a more reliable readiness signal if one exists.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        info!("Seeking to saved position {:.1}s", state.time);
+        self.set_playback_time(state.time).await
+    }
 }
 
 trait ToJson {
     fn json(self) -> serde_json::Value;
 }
-impl<T> ToJson for T
-where
-    T: Into<serde_json::Value>,
-{
+impl<T: Into<serde_json::Value>> ToJson for T {
     fn json(self) -> serde_json::Value {
         self.into()
     }
