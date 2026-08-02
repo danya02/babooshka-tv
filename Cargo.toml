@@ -3,4 +3,5 @@ resolver = "3"
 members = [
     "crates/babooshka",
     "crates/player",
+    "crates/playlistctl",
 ]

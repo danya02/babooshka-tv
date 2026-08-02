@@ -5,12 +5,16 @@ HOST="danya@10.22.0.51"
 DEPLOY_PATH="/opt/"
 
 echo "Building..."
-cargo build --release --target aarch64-unknown-linux-gnu
+# Only babooshka ships to the Pi. playlistctl is a workstation tool that talks
+# to the media host over SSH, so cross-compiling it here would be wasted work.
+cargo build --release --target aarch64-unknown-linux-gnu -p babooshka
 
 echo "Finding executables..."
-BINARIES=$(find target/aarch64-unknown-linux-gnu/release -maxdepth 1 -type f -executable -printf '%f\n')
+# Named explicitly rather than globbed, so a stale cross-built playlistctl left
+# in the target directory can never be picked up and shipped.
+BINARIES=babooshka
 
-if [ -z "$BINARIES" ]; then
+if [ ! -f "target/aarch64-unknown-linux-gnu/release/$BINARIES" ]; then
     echo "No executables found!"
     exit 1
 fi

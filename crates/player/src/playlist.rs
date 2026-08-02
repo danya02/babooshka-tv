@@ -41,3 +41,19 @@ impl Playlist {
         self.items[0].clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `playlistctl` records dismissed files under an `ignored` key in the same
+    /// file. The player must keep loading such a playlist, so this type must not
+    /// gain `deny_unknown_fields`.
+    #[test]
+    fn extra_keys_written_by_playlistctl_are_tolerated() {
+        let json = r#"{"items":["/srv/a.mkv","/srv/b.mkv"],"ignored":["/srv/art.jpg"]}"#;
+        let pl: Playlist = serde_json::from_str(json).expect("playlist with ignored key must load");
+        assert_eq!(pl.items.len(), 2);
+        assert_eq!(pl.next_file(&PathBuf::from("/srv/a.mkv")), PathBuf::from("/srv/b.mkv"));
+    }
+}
